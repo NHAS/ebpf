@@ -2,3 +2,4 @@
 *bpfel*
 *.o
 ebpf
+.vscode
