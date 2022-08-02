@@ -52,23 +52,31 @@ static __always_inline int parse_ip_src_dst_addr(struct xdp_md *ctx, __u32 *ip_s
     return 1;
 }
 
+static __always_inline int conntrack(__u32 *src_ip, __u32 *dst_ip)
+{
+    void *innerMap = bpf_map_lookup_elem(&allowance_table, src_ip);
+    return innerMap && bpf_map_lookup_elem(innerMap, dst_ip);
+}
+
 SEC("xdp")
 int xdp_prog_func(struct xdp_md *ctx)
 {
     __u32 src_ip, dst_ip;
     if (!parse_ip_src_dst_addr(ctx, &src_ip, &dst_ip))
     {
-        goto done;
+        return XDP_DROP;
     }
 
-    __u8 *blocked = bpf_map_lookup_elem(&allowance_table, &src_ip);
-    if (blocked)
+    if (conntrack(&src_ip, &dst_ip) || conntrack(&dst_ip, &src_ip))
     {
-
         return XDP_PASS;
     }
 
-done:
-    // Try changing this to XDP_DROP and see what happens!
+    // void *entry = bpf_map_lookup_elem(bucketEntry, &dst_ip);
+    // if (entry)
+    // {
+    //     return XDP_PASS;
+    // }
+
     return XDP_DROP;
 }
