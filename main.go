@@ -39,11 +39,34 @@ func main() {
 		log.Fatalf("lookup network iface %q: %s", ifaceName, err)
 	}
 
+	spec, err := loadBpf()
+	if err != nil {
+		log.Fatalf("loading spec: %s", err)
+	}
+
+	innerMapSpec := &ebpf.MapSpec{
+		Name:      "inner_map",
+		Type:      ebpf.Hash,
+		KeySize:   4, // 4 bytes for u32 (ipv4)
+		ValueSize: 1, // 1 byte for u8, quasi bool
+
+		// This flag is required for dynamically sized inner maps.
+		// Added in linux 5.10.
+		//Flags: unix.BPF_F_INNER_MAP,
+
+		// We set this to 256 now, but this inner map spec gets copied
+		// and altered later.
+		MaxEntries: 256,
+	}
+
+	spec.Maps["allowance_table"].InnerMap = innerMapSpec
+
 	// Load pre-compiled programs into the kernel.
 	objs := bpfObjects{}
-	if err := loadBpfObjects(&objs, nil); err != nil {
+	if err = spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("loading objects: %s", err)
 	}
+
 	defer objs.Close()
 
 	// Attach the program.
@@ -70,34 +93,107 @@ func main() {
 
 		switch strings.TrimSpace(text) {
 		case "l", "list":
-			s, err := printMap(objs.XdpStatsMap)
+			s, err := printMap(objs.AllowanceTable)
 			if err != nil {
 				log.Fatal(err)
 			}
 			log.Println(s)
 		case "a", "add":
-			ip, err := askIp()
+			fmt.Print("Bucket IP: ")
+			bucket, err := askIp()
 			if err != nil {
 				fmt.Println("Not an ip address")
 				continue
 			}
 
-			err = objs.XdpStatsMap.Put([]byte(ip.To4()), uint8(1))
+			fmt.Print("IP dst: ")
+			dest, err := askIp()
 			if err != nil {
-				log.Fatal(err)
+				fmt.Println("Not an ip address")
+				continue
 			}
+
+			var innerMapID ebpf.MapID
+			err = objs.AllowanceTable.Lookup([]byte(bucket.To4()), &innerMapID)
+			if err != nil {
+				if strings.Contains(err.Error(), ebpf.ErrKeyNotExist.Error()) {
+					inner, err := ebpf.NewMap(innerMapSpec)
+					if err != nil {
+						log.Fatalf("create new map: %s", err)
+					}
+					defer inner.Close()
+
+					err = objs.AllowanceTable.Put([]byte(bucket.To4()), uint32(inner.FD()))
+					if err != nil {
+						log.Fatalf("put outer: %s", err)
+					}
+
+					//Little bit clumbsy, but has to be done as there is no bpf_map_get_fd_by_id function in ebpf go style :P
+					err = objs.AllowanceTable.Lookup([]byte(bucket.To4()), &innerMapID)
+					if err != nil {
+						log.Fatalf("lookup inner: %s", err)
+					}
+
+				} else {
+					log.Fatalf("%s", err)
+				}
+			}
+
+			objs.AllowanceTable.FD()
+
+			innerMap, err := ebpf.NewMapFromID(innerMapID)
+			if err != nil {
+				log.Fatalf("inner map: %s", err)
+			}
+
+			err = innerMap.Put([]byte(dest.To4()), uint8(1))
+			if err != nil {
+				log.Fatalf("inner map: %s", err)
+			}
+
 		case "r", "remove":
-			ip, err := askIp()
+			fmt.Print("Bucket ip: ")
+			bucket, err := askIp()
 			if err != nil {
 				fmt.Println("Not an ip address")
 				continue
 			}
 
-			err = objs.XdpStatsMap.Delete([]byte(ip.To4()))
-			if err != nil {
-				log.Fatal(err)
+			fmt.Print("Internal ip (or empty to remove bucket): ")
+			target, _ := askIp()
+
+			if target != nil {
+				var innerMapID ebpf.MapID
+				err = objs.AllowanceTable.Lookup([]byte(bucket.To4()), &innerMapID)
+				if err != nil {
+					if strings.Contains(err.Error(), ebpf.ErrKeyNotExist.Error()) {
+						log.Fatalf("lookup inner: %s", err)
+					}
+				}
+
+				inner, err := ebpf.NewMapFromID(innerMapID)
+				if err != nil {
+					log.Fatalf("create new map: %s", err)
+				}
+
+				err = inner.Delete([]byte(target.To4()))
+				if err != nil {
+					inner.Close()
+
+					log.Println(err)
+					continue
+				}
+
+				inner.Close()
+
+				continue
 			}
 
+			err = objs.AllowanceTable.Delete([]byte(bucket.To4()))
+			if err != nil {
+				log.Println(err)
+				continue
+			}
 		}
 
 	}
@@ -105,7 +201,6 @@ func main() {
 
 func askIp() (net.IP, error) {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Enter IP: ")
 	ip, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, err
@@ -121,15 +216,31 @@ func askIp() (net.IP, error) {
 
 func printMap(m *ebpf.Map) (string, error) {
 	var (
-		sb  strings.Builder
-		key []byte
-		val uint8
+		sb         strings.Builder
+		key        []byte
+		innerMapID ebpf.MapID
 	)
+
 	iter := m.Iterate()
-	for iter.Next(&key, &val) {
+	sb.WriteString("\n")
+	for iter.Next(&key, &innerMapID) {
 		sourceIP := net.IP(key) // IPv4 source address in network byte order.
 
-		sb.WriteString(fmt.Sprintf("\t%s blocked\n", sourceIP))
+		innerMap, err := ebpf.NewMapFromID(innerMapID)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		sb.WriteString(fmt.Sprintf("%s:\n", sourceIP))
+
+		var innerKey []byte
+		var val uint8
+		innerIter := innerMap.Iterate()
+		for innerIter.Next(&innerKey, &val) {
+			destIP := net.IP(innerKey)
+			sb.WriteString(fmt.Sprintf("\t%s\n", destIP))
+		}
+
 	}
 	return sb.String(), iter.Err()
 }

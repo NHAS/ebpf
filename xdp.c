@@ -5,22 +5,22 @@
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
-#define MAX_MAP_ENTRIES 16
+// One /24
+#define MAX_MAP_ENTRIES 256
 
-/* Define an LRU hash map for storing packet count by source IPv4 address */
-struct
-{
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, MAX_MAP_ENTRIES);
-    __type(key, __u32);  // source IPv4 address
-    __type(value, __u8); // packet count
-} xdp_stats_map SEC(".maps");
+struct bpf_map_def SEC("maps") allowance_table = {
+    .type = BPF_MAP_TYPE_HASH_OF_MAPS,
+    .max_entries = MAX_MAP_ENTRIES,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u32),
+    .map_flags = 0,
+};
 
 /*
 Attempt to parse the IPv4 source address from the packet.
 Returns 0 if there is no IPv4 header field; otherwise returns non-zero.
 */
-static __always_inline int parse_ip_src_addr(struct xdp_md *ctx, __u32 *ip_src_addr)
+static __always_inline int parse_ip_src_dst_addr(struct xdp_md *ctx, __u32 *ip_src_addr, __u32 *ip_dst_addr)
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
@@ -47,25 +47,23 @@ static __always_inline int parse_ip_src_addr(struct xdp_md *ctx, __u32 *ip_src_a
 
     // Return the source IP address in network byte order.
     *ip_src_addr = (__u32)(ip->saddr);
+    *ip_dst_addr = (__u32)(ip->daddr);
+
     return 1;
 }
 
 SEC("xdp")
 int xdp_prog_func(struct xdp_md *ctx)
 {
-    __u32 ip;
-    if (!parse_ip_src_addr(ctx, &ip))
+    __u32 src_ip, dst_ip;
+    if (!parse_ip_src_dst_addr(ctx, &src_ip, &dst_ip))
     {
-        // Not an IPv4 packet, so don't count it.
         goto done;
     }
 
-    __u8 *blocked = bpf_map_lookup_elem(&xdp_stats_map, &ip);
+    __u8 *blocked = bpf_map_lookup_elem(&allowance_table, &src_ip);
     if (blocked)
     {
-        // No entry in the map for this IP address yet, so set the initial value to 1.
-        //__u32 init_pkt_count = 1;
-        // bpf_map_update_elem(&xdp_stats_map, &ip, &init_pkt_count, BPF_ANY);
 
         return XDP_PASS;
     }
