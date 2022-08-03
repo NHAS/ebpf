@@ -1,5 +1,7 @@
 # ebpf
 
+Tiny little firewall showing how to use cilium ebpf with complex map types. 
+Probably one of the only `BPF_MAP_TYPE_LPM_TRIE` examples on the internet. 
 
 # Installation
 
