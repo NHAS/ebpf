@@ -13,6 +13,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -26,6 +27,22 @@ import (
 
 // $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf xdp.c -- -I headers
+
+type LPMtrieKey struct {
+
+	// first member must be a prefix u32 wide
+	// rest can are arbitrary
+	Prefixlen uint32
+	IP        net.IP
+}
+
+func (l LPMtrieKey) Bytes() []byte {
+	output := make([]byte, 8)
+	binary.LittleEndian.PutUint32(output[0:4], l.Prefixlen)
+	copy(output[4:], l.IP.To4())
+
+	return output
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -46,17 +63,17 @@ func main() {
 
 	innerMapSpec := &ebpf.MapSpec{
 		Name:      "inner_map",
-		Type:      ebpf.Hash,
-		KeySize:   4, // 4 bytes for u32 (ipv4)
+		Type:      ebpf.LPMTrie,
+		KeySize:   8, // 4 bytes for prefix, 4 bytes for u32 (ipv4)
 		ValueSize: 1, // 1 byte for u8, quasi bool
 
 		// This flag is required for dynamically sized inner maps.
 		// Added in linux 5.10.
 		//Flags: unix.BPF_F_INNER_MAP,
 
-		// We set this to 256 now, but this inner map spec gets copied
+		// We set this to 100 now, but this inner map spec gets copied
 		// and altered later.
-		MaxEntries: 256,
+		MaxEntries: 1000,
 	}
 
 	spec.Maps["allowance_table"].InnerMap = innerMapSpec
@@ -146,7 +163,9 @@ func main() {
 				log.Fatalf("inner map: %s", err)
 			}
 
-			err = innerMap.Put([]byte(dest.To4()), uint8(1))
+			k := LPMtrieKey{Prefixlen: 32, IP: dest}
+
+			err = innerMap.Put(k.Bytes(), uint8(1))
 			if err != nil {
 				log.Fatalf("inner map: %s", err)
 			}
@@ -176,7 +195,9 @@ func main() {
 					log.Fatalf("create new map: %s", err)
 				}
 
-				err = inner.Delete([]byte(target.To4()))
+				k := LPMtrieKey{Prefixlen: 32, IP: target}
+
+				err = inner.Delete(k.Bytes())
 				if err != nil {
 					inner.Close()
 
