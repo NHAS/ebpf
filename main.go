@@ -23,6 +23,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 )
 
 // $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
@@ -42,6 +43,17 @@ func (l LPMtrieKey) Bytes() []byte {
 	copy(output[4:], l.IP.To4())
 
 	return output
+}
+
+func (l *LPMtrieKey) Unpack(b []byte) error {
+	if len(b) != 8 {
+		return errors.New("Too short")
+	}
+
+	l.Prefixlen = binary.LittleEndian.Uint32(b[:4])
+	l.IP = b[4:]
+
+	return nil
 }
 
 func main() {
@@ -69,7 +81,7 @@ func main() {
 
 		// This flag is required for dynamically sized inner maps.
 		// Added in linux 5.10.
-		//Flags: unix.BPF_F_INNER_MAP,
+		Flags: unix.BPF_F_NO_PREALLOC,
 
 		// We set this to 100 now, but this inner map spec gets copied
 		// and altered later.
@@ -112,19 +124,19 @@ func main() {
 		case "l", "list":
 			s, err := printMap(objs.AllowanceTable)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal("list", err)
 			}
 			log.Println(s)
 		case "a", "add":
 			fmt.Print("Bucket IP: ")
-			bucket, err := askIp()
+			bucket, _, err := askIp()
 			if err != nil {
 				fmt.Println("Not an ip address")
 				continue
 			}
 
 			fmt.Print("IP dst: ")
-			dest, err := askIp()
+			dest, mask, err := askIp()
 			if err != nil {
 				fmt.Println("Not an ip address")
 				continue
@@ -152,7 +164,7 @@ func main() {
 					}
 
 				} else {
-					log.Fatalf("%s", err)
+					log.Fatalf("lookup outer: %s", err)
 				}
 			}
 
@@ -163,7 +175,7 @@ func main() {
 				log.Fatalf("inner map: %s", err)
 			}
 
-			k := LPMtrieKey{Prefixlen: 32, IP: dest}
+			k := LPMtrieKey{Prefixlen: mask, IP: dest}
 
 			err = innerMap.Put(k.Bytes(), uint8(1))
 			if err != nil {
@@ -172,14 +184,14 @@ func main() {
 
 		case "r", "remove":
 			fmt.Print("Bucket ip: ")
-			bucket, err := askIp()
+			bucket, _, err := askIp()
 			if err != nil {
 				fmt.Println("Not an ip address")
 				continue
 			}
 
 			fmt.Print("Internal ip (or empty to remove bucket): ")
-			target, _ := askIp()
+			target, mask, _ := askIp()
 
 			if target != nil {
 				var innerMapID ebpf.MapID
@@ -195,7 +207,7 @@ func main() {
 					log.Fatalf("create new map: %s", err)
 				}
 
-				k := LPMtrieKey{Prefixlen: 32, IP: target}
+				k := LPMtrieKey{Prefixlen: mask, IP: target}
 
 				err = inner.Delete(k.Bytes())
 				if err != nil {
@@ -220,19 +232,27 @@ func main() {
 	}
 }
 
-func askIp() (net.IP, error) {
+func askIp() (net.IP, uint32, error) {
 	reader := bufio.NewReader(os.Stdin)
-	ip, err := reader.ReadString('\n')
+	ipString, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	out := net.ParseIP(strings.TrimSpace(ip))
-	if out == nil {
-		return nil, errors.New("Could not parse ip from input")
+	ipString = strings.TrimSpace(ipString)
+
+	ip, netmask, err := net.ParseCIDR(ipString)
+	if err != nil {
+		out := net.ParseIP(ipString)
+		if out != nil {
+			return out, 32, nil
+		}
+
+		return nil, 0, errors.New("Could not parse ip from input")
 	}
 
-	return out, nil
+	ones, _ := netmask.Mask.Size()
+	return ip, uint32(ones), nil
 }
 
 func printMap(m *ebpf.Map) (string, error) {
@@ -249,7 +269,7 @@ func printMap(m *ebpf.Map) (string, error) {
 
 		innerMap, err := ebpf.NewMapFromID(innerMapID)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("map from id: ", err)
 		}
 
 		sb.WriteString(fmt.Sprintf("%s:\n", sourceIP))
@@ -257,9 +277,10 @@ func printMap(m *ebpf.Map) (string, error) {
 		var innerKey []byte
 		var val uint8
 		innerIter := innerMap.Iterate()
+		kv := LPMtrieKey{}
 		for innerIter.Next(&innerKey, &val) {
-			destIP := net.IP(innerKey)
-			sb.WriteString(fmt.Sprintf("\t%s\n", destIP))
+			kv.Unpack(innerKey)
+			sb.WriteString(fmt.Sprintf("\t%s/%d\n", kv.IP, kv.Prefixlen))
 		}
 
 	}
