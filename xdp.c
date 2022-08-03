@@ -78,7 +78,7 @@ int xdp_prog_func(struct xdp_md *ctx)
     __u32 src_ip, dst_ip;
     if (!parse_ip_src_dst_addr(ctx, &src_ip, &dst_ip))
     {
-        return XDP_DROP;
+        return XDP_PASS;
     }
 
     if (conntrack(&src_ip, &dst_ip) || conntrack(&dst_ip, &src_ip))

@@ -168,8 +168,6 @@ func main() {
 				}
 			}
 
-			objs.AllowanceTable.FD()
-
 			innerMap, err := ebpf.NewMapFromID(innerMapID)
 			if err != nil {
 				log.Fatalf("inner map: %s", err)
@@ -181,6 +179,8 @@ func main() {
 			if err != nil {
 				log.Fatalf("inner map: %s", err)
 			}
+
+			innerMap.Close()
 
 		case "r", "remove":
 			fmt.Print("Bucket ip: ")
@@ -282,6 +282,7 @@ func printMap(m *ebpf.Map) (string, error) {
 			kv.Unpack(innerKey)
 			sb.WriteString(fmt.Sprintf("\t%s/%d\n", kv.IP, kv.Prefixlen))
 		}
+		innerMap.Close()
 
 	}
 	return sb.String(), iter.Err()
